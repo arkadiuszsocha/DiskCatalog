@@ -2,14 +2,15 @@ import sys
 import os
 import sqlite3
 import hashlib
+import asyncio
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QTreeView, QVBoxLayout, QWidget,
     QMessageBox, QListWidget, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
     QLabel, QStatusBar, QStyleFactory, QMenu, QInputDialog, QMenuBar,
-    QProgressDialog, QCheckBox, QDialog, QDialogButtonBox, QFormLayout
+    QProgressDialog, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QListWidgetItem
 )
-from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon, QPalette, QColor, QFont
 
 class CompareOptionsDialog(QDialog):
@@ -341,6 +342,105 @@ class ComparisonResultsWindow(QMainWindow):
         if item:
             tree.setCurrentItem(item)
 
+class CatalogWorker(QThread):
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+    
+    def __init__(self, root_path, calculate_md5):
+        super().__init__()
+        self.root_path = root_path
+        self.calculate_md5 = calculate_md5
+        self.catalog_name = os.path.basename(root_path)
+        self.conn = None
+        self.cursor = None
+        self.catalog_id = None
+        self.is_cancelled = False
+        
+    def run(self):
+        try:
+            self.conn = sqlite3.connect('folder_catalog.db')
+            self.cursor = self.conn.cursor()
+            
+            # Insert catalog
+            self.cursor.execute(
+                'INSERT INTO catalogs (name, root_path) VALUES (?, ?)',
+                (self.catalog_name, self.root_path)
+            )
+            self.catalog_id = self.cursor.lastrowid
+            
+            # Count total files for progress bar
+            total_files = sum([len(files) for _, _, files in os.walk(self.root_path)])
+            files_processed = 0
+            
+            # Walk through directory and save structure
+            for root, dirs, files in os.walk(self.root_path):
+                if self.is_cancelled:
+                    self.conn.rollback()
+                    return
+                    
+                # Save directories
+                for dir_name in dirs:
+                    full_path = os.path.join(root, dir_name)
+                    rel_path = os.path.relpath(full_path, self.root_path)
+                    self.cursor.execute(
+                        'INSERT INTO files (catalog_id, path, name, is_directory, size, modified_at) VALUES (?, ?, ?, ?, ?, ?)',
+                        (self.catalog_id, rel_path, dir_name, True, 0, datetime.fromtimestamp(os.path.getmtime(full_path)))
+                    )
+                    self.progress.emit(files_processed, f"Processing directory: {rel_path}")
+
+                # Save files
+                for file_name in files:
+                    if self.is_cancelled:
+                        self.conn.rollback()
+                        return
+
+                    full_path = os.path.join(root, file_name)
+                    try:
+                        rel_path = os.path.relpath(full_path, self.root_path)
+                        size = os.path.getsize(full_path)
+                        modified = datetime.fromtimestamp(os.path.getmtime(full_path))
+                        
+                        # Calculate MD5 if requested
+                        md5_hash = None
+                        if self.calculate_md5:
+                            self.progress.emit(files_processed, f"Calculating MD5: {rel_path}")
+                            md5_hash = self.calculate_md5_hash(full_path)
+                        
+                        self.cursor.execute(
+                            'INSERT INTO files (catalog_id, path, name, is_directory, size, modified_at, md5_hash) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                            (self.catalog_id, rel_path, file_name, False, size, modified, md5_hash)
+                        )
+                        
+                        files_processed += 1
+                        self.progress.emit(files_processed, f"Processing: {rel_path}")
+                    except (OSError, FileNotFoundError):
+                        continue
+
+            self.conn.commit()
+            self.finished.emit()
+            
+        except sqlite3.Error as e:
+            self.error.emit(str(e))
+            if self.conn:
+                self.conn.rollback()
+        finally:
+            if self.conn:
+                self.conn.close()
+    
+    def calculate_md5_hash(self, file_path):
+        """Calculate MD5 hash of a file"""
+        hash_md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                if self.is_cancelled:
+                    return None
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    
+    def cancel(self):
+        self.is_cancelled = True
+
 class FolderCatalogApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -567,121 +667,134 @@ class FolderCatalogApp(QMainWindow):
 
     def update_catalog(self, item):
         """Update the selected catalog"""
-        catalog_name = item.text().split(" (")[0]
-        self.cursor.execute('SELECT id, root_path FROM catalogs WHERE name = ?', (catalog_name,))
-        result = self.cursor.fetchone()
-        if not result:
-            return
-
-        catalog_id, root_path = result
-        
-        # Ask if user wants to calculate MD5 hashes
-        calculate_md5 = QMessageBox.question(
-            self, "MD5 Calculation",
-            "Do you want to calculate MD5 hashes for files? (This will take longer but allows for more accurate comparison)",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        ) == QMessageBox.Yes
+        catalog_id = item.data(Qt.UserRole)  # Get catalog ID from the item
         
         try:
-            # Delete existing files
-            self.cursor.execute('DELETE FROM files WHERE catalog_id = ?', (catalog_id,))
+            # Create a new connection for this operation
+            conn = sqlite3.connect('folder_catalog.db')
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT name, root_path FROM catalogs WHERE id = ?', (catalog_id,))
+            result = cursor.fetchone()
+            if not result:
+                return
+                
+            catalog_name, root_path = result
+            
+            # Ask if user wants to calculate MD5 hashes
+            calculate_md5 = QMessageBox.question(
+                self, "MD5 Calculation",
+                "Do you want to calculate MD5 hashes for files? (This will take longer but allows for more accurate comparison)",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            ) == QMessageBox.Yes
             
             # Count total files for progress bar
             total_files = sum([len(files) for _, _, files in os.walk(root_path)])
-            progress = QProgressDialog("Updating catalog...", "Cancel", 0, total_files, self)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setWindowTitle("Progress")
-            files_processed = 0
             
-            # Walk through directory and save structure
-            for root, dirs, files in os.walk(root_path):
-                # Save directories
-                for dir_name in dirs:
-                    full_path = os.path.join(root, dir_name)
-                    rel_path = os.path.relpath(full_path, root_path)
-                    self.cursor.execute(
-                        'INSERT INTO files (catalog_id, path, name, is_directory, size, modified_at) VALUES (?, ?, ?, ?, ?, ?)',
-                        (catalog_id, rel_path, dir_name, True, 0, datetime.fromtimestamp(os.path.getmtime(full_path)))
-                    )
-
-                # Save files
-                for file_name in files:
-                    if progress.wasCanceled():
-                        self.conn.rollback()
-                        return
-
-                    full_path = os.path.join(root, file_name)
-                    try:
-                        rel_path = os.path.relpath(full_path, root_path)
-                        size = os.path.getsize(full_path)
-                        modified = datetime.fromtimestamp(os.path.getmtime(full_path))
-                        
-                        # Calculate MD5 if requested
-                        md5_hash = self.calculate_md5(full_path) if calculate_md5 else None
-                        
-                        self.cursor.execute(
-                            'INSERT INTO files (catalog_id, path, name, is_directory, size, modified_at, md5_hash) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                            (catalog_id, rel_path, file_name, False, size, modified, md5_hash)
-                        )
-                        
-                        files_processed += 1
-                        progress.setValue(files_processed)
-                    except (OSError, FileNotFoundError):
-                        continue
-
-            self.conn.commit()
-            self.load_catalog(item)  # Reload the catalog
-            self.statusBar.showMessage(f"Catalog '{catalog_name}' updated successfully")
-            QMessageBox.information(self, "Success", f"Catalog '{catalog_name}' has been updated successfully!")
-
+            # Create progress dialog
+            self.progress = QProgressDialog("Initializing...", "Cancel", 0, total_files, self)
+            self.progress.setWindowModality(Qt.WindowModal)
+            self.progress.setWindowTitle("Progress")
+            self.progress.setMinimumDuration(0)
+            self.progress.setAutoClose(True)
+            self.progress.setAutoReset(True)
+            
+            # Create and start worker thread
+            self.worker = CatalogWorker(root_path, calculate_md5)
+            self.worker.progress.connect(self.update_progress)
+            self.worker.finished.connect(self.on_catalog_finished)
+            self.worker.error.connect(self.on_catalog_error)
+            self.progress.canceled.connect(self.worker.cancel)
+            
+            # Start the worker
+            self.worker.start()
+            
         except sqlite3.Error as e:
             QMessageBox.critical(self, "Error", f"Error updating catalog: {str(e)}")
-            self.conn.rollback()
+        finally:
+            if 'conn' in locals():
+                conn.close()
 
     def rename_catalog(self, item):
         """Rename the selected catalog"""
-        old_name = item.text().split(" (")[0]
-        new_name, ok = QInputDialog.getText(
-            self, "Rename Catalog", 
-            "Enter new name:", 
-            text=old_name
-        )
+        catalog_id = item.data(Qt.UserRole)  # Get catalog ID from the item
         
-        if ok and new_name and new_name != old_name:
-            try:
-                self.cursor.execute(
-                    'UPDATE catalogs SET name = ? WHERE name = ?',
-                    (new_name, old_name)
+        try:
+            # Create a new connection for this operation
+            conn = sqlite3.connect('folder_catalog.db')
+            cursor = conn.cursor()
+            
+            # Get current name
+            cursor.execute('SELECT name FROM catalogs WHERE id = ?', (catalog_id,))
+            result = cursor.fetchone()
+            if not result:
+                return
+                
+            old_name = result[0]
+            
+            new_name, ok = QInputDialog.getText(
+                self, "Rename Catalog", 
+                "Enter new name:", 
+                text=old_name
+            )
+            
+            if ok and new_name and new_name != old_name:
+                cursor.execute(
+                    'UPDATE catalogs SET name = ? WHERE id = ?',
+                    (new_name, catalog_id)
                 )
-                self.conn.commit()
+                conn.commit()
                 self.update_catalog_list()
                 self.statusBar.showMessage(f"Catalog renamed from '{old_name}' to '{new_name}'")
-            except sqlite3.Error as e:
-                QMessageBox.critical(self, "Error", f"Error renaming catalog: {str(e)}")
-                self.conn.rollback()
+                
+        except sqlite3.Error as e:
+            QMessageBox.critical(self, "Error", f"Error renaming catalog: {str(e)}")
+            if 'conn' in locals():
+                conn.rollback()
+        finally:
+            if 'conn' in locals():
+                conn.close()
 
     def delete_catalog(self, item):
         """Delete the selected catalog"""
-        catalog_name = item.text().split(" (")[0]
-        reply = QMessageBox.question(
-            self, "Delete Catalog",
-            f"Are you sure you want to delete the catalog '{catalog_name}'?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
+        catalog_id = item.data(Qt.UserRole)  # Get catalog ID from the item
         
-        if reply == QMessageBox.Yes:
-            try:
-                self.cursor.execute('DELETE FROM files WHERE catalog_id IN (SELECT id FROM catalogs WHERE name = ?)', (catalog_name,))
-                self.cursor.execute('DELETE FROM catalogs WHERE name = ?', (catalog_name,))
-                self.conn.commit()
+        try:
+            # Create a new connection for this operation
+            conn = sqlite3.connect('folder_catalog.db')
+            cursor = conn.cursor()
+            
+            # Get catalog name for the confirmation dialog
+            cursor.execute('SELECT name FROM catalogs WHERE id = ?', (catalog_id,))
+            result = cursor.fetchone()
+            if not result:
+                return
+                
+            catalog_name = result[0]
+            
+            reply = QMessageBox.question(
+                self, "Delete Catalog",
+                f"Are you sure you want to delete the catalog '{catalog_name}'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                cursor.execute('DELETE FROM files WHERE catalog_id = ?', (catalog_id,))
+                cursor.execute('DELETE FROM catalogs WHERE id = ?', (catalog_id,))
+                conn.commit()
                 self.update_catalog_list()
                 self.tree.clear()
-                self.statusBar.showMessage(f"Catalog '{catalog_name}' deleted")
-            except sqlite3.Error as e:
-                QMessageBox.critical(self, "Error", f"Error deleting catalog: {str(e)}")
-                self.conn.rollback()
+                self.statusBar.showMessage(f"Catalog deleted")
+                
+        except sqlite3.Error as e:
+            QMessageBox.critical(self, "Error", f"Error deleting catalog: {str(e)}")
+            if 'conn' in locals():
+                conn.rollback()
+        finally:
+            if 'conn' in locals():
+                conn.close()
 
     def set_dark_theme(self):
         """Set dark theme for the application"""
@@ -765,50 +878,80 @@ class FolderCatalogApp(QMainWindow):
 
     def update_catalog_list(self):
         """Update the list of saved catalogs"""
-        self.catalog_list.clear()
-        self.cursor.execute('SELECT id, name, root_path FROM catalogs ORDER BY created_at DESC')
-        for catalog_id, name, path in self.cursor.fetchall():
-            self.catalog_list.addItem(f"{name} ({os.path.basename(path)})")
+        try:
+            # Create a new connection for this operation
+            conn = sqlite3.connect('folder_catalog.db')
+            cursor = conn.cursor()
+            
+            self.catalog_list.clear()
+            cursor.execute('SELECT id, name, root_path FROM catalogs ORDER BY created_at DESC')
+            for catalog_id, name, path in cursor.fetchall():
+                item = QListWidgetItem(f"{name} ({os.path.basename(path)})")
+                item.setData(Qt.UserRole, catalog_id)  # Store catalog ID in the item
+                self.catalog_list.addItem(item)
+                
+        except sqlite3.Error as e:
+            QMessageBox.critical(self, "Error", f"Error updating catalog list: {str(e)}")
+        finally:
+            if 'conn' in locals():
+                conn.close()
 
     def load_catalog(self, item):
         """Load selected catalog into the tree view"""
-        catalog_name = item.text().split(" (")[0]
-        self.cursor.execute('SELECT id, root_path FROM catalogs WHERE name = ?', (catalog_name,))
-        result = self.cursor.fetchone()
-        if result:
-            catalog_id, root_path = result
-            self.tree.clear()
+        catalog_id = item.data(Qt.UserRole)  # Get catalog ID from the item
             
-            # Get all files and directories for this catalog
-            self.cursor.execute('''
-                SELECT path, name, is_directory, size, modified_at 
-                FROM files 
-                WHERE catalog_id = ? 
-                ORDER BY path
-            ''', (catalog_id,))
+        try:
+            # Create a new connection for this operation
+            conn = sqlite3.connect('folder_catalog.db')
+            cursor = conn.cursor()
             
-            # Create a dictionary to store path -> item mapping
-            path_to_item = {}
+            cursor.execute('SELECT name, root_path FROM catalogs WHERE id = ?', (catalog_id,))
+            result = cursor.fetchone()
             
-            # First pass: create all items
-            for rel_path, name, is_dir, size, modified in self.cursor.fetchall():
-                parent_path = os.path.dirname(rel_path)
-                item = QTreeWidgetItem()
-                item.setText(0, name)
-                if not is_dir:
-                    item.setText(1, self.format_size(size))
-                item.setText(2, datetime.fromisoformat(modified).strftime('%Y-%m-%d %H:%M:%S'))
-                path_to_item[rel_path] = item
+            if result:
+                catalog_name, root_path = result
+                self.tree.clear()
+                
+                # Get all files and directories for this catalog
+                cursor.execute('''
+                    SELECT path, name, is_directory, size, modified_at 
+                    FROM files 
+                    WHERE catalog_id = ? 
+                    ORDER BY path
+                ''', (catalog_id,))
+                
+                files = cursor.fetchall()
+                
+                # Create a dictionary to store path -> item mapping
+                path_to_item = {}
+                
+                # First pass: create all items
+                for rel_path, name, is_dir, size, modified in files:
+                    parent_path = os.path.dirname(rel_path)
+                    item = QTreeWidgetItem()
+                    item.setText(0, name)
+                    if not is_dir:
+                        item.setText(1, self.format_size(size))
+                    item.setText(2, datetime.fromisoformat(modified).strftime('%Y-%m-%d %H:%M:%S'))
+                    path_to_item[rel_path] = item
+                
+                # Second pass: set up parent-child relationships
+                for rel_path, item in path_to_item.items():
+                    parent_path = os.path.dirname(rel_path)
+                    if parent_path in path_to_item:
+                        path_to_item[parent_path].addChild(item)
+                    else:
+                        self.tree.addTopLevelItem(item)
+                
+                self.statusBar.showMessage(f"Loaded catalog: {catalog_name}")
             
-            # Second pass: set up parent-child relationships
-            for rel_path, item in path_to_item.items():
-                parent_path = os.path.dirname(rel_path)
-                if parent_path in path_to_item:
-                    path_to_item[parent_path].addChild(item)
-                else:
-                    self.tree.addTopLevelItem(item)
-            
-            self.statusBar.showMessage(f"Loaded catalog: {catalog_name}")
+        except sqlite3.Error as e:
+            QMessageBox.critical(self, "Error", f"Error loading catalog: {str(e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Unexpected error: {str(e)}")
+        finally:
+            if 'conn' in locals():
+                conn.close()
 
     def format_size(self, size):
         """Format file size in human readable format"""
@@ -840,68 +983,47 @@ class FolderCatalogApp(QMainWindow):
             QMessageBox.No
         ) == QMessageBox.Yes
 
-        # Use folder name as catalog name
-        catalog_name = os.path.basename(root_path)
-
-        try:
-            # Insert catalog
-            self.cursor.execute(
-                'INSERT INTO catalogs (name, root_path) VALUES (?, ?)',
-                (catalog_name, root_path)
-            )
-            catalog_id = self.cursor.lastrowid
-
-            # Count total files for progress bar
-            total_files = sum([len(files) for _, _, files in os.walk(root_path)])
-            progress = QProgressDialog("Cataloging files...", "Cancel", 0, total_files, self)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setWindowTitle("Progress")
-            files_processed = 0
-
-            # Walk through directory and save structure
-            for root, dirs, files in os.walk(root_path):
-                # Save directories
-                for dir_name in dirs:
-                    full_path = os.path.join(root, dir_name)
-                    rel_path = os.path.relpath(full_path, root_path)
-                    self.cursor.execute(
-                        'INSERT INTO files (catalog_id, path, name, is_directory, size, modified_at) VALUES (?, ?, ?, ?, ?, ?)',
-                        (catalog_id, rel_path, dir_name, True, 0, datetime.fromtimestamp(os.path.getmtime(full_path)))
-                    )
-
-                # Save files
-                for file_name in files:
-                    if progress.wasCanceled():
-                        self.conn.rollback()
-                        return
-
-                    full_path = os.path.join(root, file_name)
-                    try:
-                        rel_path = os.path.relpath(full_path, root_path)
-                        size = os.path.getsize(full_path)
-                        modified = datetime.fromtimestamp(os.path.getmtime(full_path))
-                        
-                        # Calculate MD5 if requested
-                        md5_hash = self.calculate_md5(full_path) if calculate_md5 else None
-                        
-                        self.cursor.execute(
-                            'INSERT INTO files (catalog_id, path, name, is_directory, size, modified_at, md5_hash) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                            (catalog_id, rel_path, file_name, False, size, modified, md5_hash)
-                        )
-                        
-                        files_processed += 1
-                        progress.setValue(files_processed)
-                    except (OSError, FileNotFoundError):
-                        continue
-
-            self.conn.commit()
-            self.update_catalog_list()
-            self.statusBar.showMessage(f"Catalog '{catalog_name}' saved successfully")
-            QMessageBox.information(self, "Success", f"Catalog '{catalog_name}' has been saved successfully!")
-
-        except sqlite3.Error as e:
-            QMessageBox.critical(self, "Error", f"Error saving catalog: {str(e)}")
-            self.conn.rollback()
+        # Count total files for progress bar
+        total_files = sum([len(files) for _, _, files in os.walk(root_path)])
+        
+        # Create progress dialog
+        self.progress = QProgressDialog("Initializing...", "Cancel", 0, total_files, self)
+        self.progress.setWindowModality(Qt.WindowModal)
+        self.progress.setWindowTitle("Progress")
+        self.progress.setMinimumDuration(0)
+        self.progress.setAutoClose(True)
+        self.progress.setAutoReset(True)
+        
+        # Create and start worker thread
+        self.worker = CatalogWorker(root_path, calculate_md5)
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.on_catalog_finished)
+        self.worker.error.connect(self.on_catalog_error)
+        self.progress.canceled.connect(self.worker.cancel)
+        
+        # Start the worker
+        self.worker.start()
+        
+    def update_progress(self, value, filename):
+        """Update progress dialog with percentage and current file"""
+        if hasattr(self, 'progress'):
+            self.progress.setValue(value)
+            percentage = int((value / self.progress.maximum()) * 100)
+            self.progress.setLabelText(f"Cataloging files... {percentage}%\n{filename}")
+        
+    def on_catalog_finished(self):
+        """Handle catalog creation completion"""
+        if hasattr(self, 'progress'):
+            self.progress.close()
+        self.update_catalog_list()
+        self.statusBar.showMessage(f"Catalog '{self.worker.catalog_name}' saved successfully")
+        QMessageBox.information(self, "Success", f"Catalog '{self.worker.catalog_name}' has been saved successfully!")
+        
+    def on_catalog_error(self, error_msg):
+        """Handle catalog creation error"""
+        if hasattr(self, 'progress'):
+            self.progress.close()
+        QMessageBox.critical(self, "Error", f"Error saving catalog: {error_msg}")
 
     def compare_selected_catalog(self):
         """Compare the currently selected catalog with a selected folder"""
@@ -910,40 +1032,45 @@ class FolderCatalogApp(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please select a catalog to compare")
             return
 
-        catalog_name = current_item.text().split(" (")[0]
-        self.cursor.execute('SELECT id, root_path FROM catalogs WHERE name = ?', (catalog_name,))
-        result = self.cursor.fetchone()
-        if not result:
-            return
-
-        catalog_id, original_root_path = result
-
-        # Ask user to select folder to compare with
-        compare_path = QFileDialog.getExistingDirectory(
-            self, 
-            "Select Folder to Compare With", 
-            os.path.expanduser("~"),
-            QFileDialog.ShowDirsOnly
-        )
-        if not compare_path:
-            return
-
-        # Show comparison options dialog
-        dialog = CompareOptionsDialog(self)
-        if dialog.exec_() != QDialog.Accepted:
-            return
-
-        options = dialog.get_options()
+        catalog_id = current_item.data(Qt.UserRole)  # Get catalog ID from the item
         
         try:
+            # Create a new connection for this operation
+            conn = sqlite3.connect('folder_catalog.db')
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT name, root_path FROM catalogs WHERE id = ?', (catalog_id,))
+            result = cursor.fetchone()
+            if not result:
+                return
+                
+            catalog_name, original_root_path = result
+
+            # Ask user to select folder to compare with
+            compare_path = QFileDialog.getExistingDirectory(
+                self, 
+                "Select Folder to Compare With", 
+                os.path.expanduser("~"),
+                QFileDialog.ShowDirsOnly
+            )
+            if not compare_path:
+                return
+
+            # Show comparison options dialog
+            dialog = CompareOptionsDialog(self)
+            if dialog.exec_() != QDialog.Accepted:
+                return
+
+            options = dialog.get_options()
+            
             # Get all files from catalog
-            self.cursor.execute('''
+            cursor.execute('''
                 SELECT path, name, size, md5_hash, modified_at, is_directory
                 FROM files 
                 WHERE catalog_id = ?
             ''', (catalog_id,))
             catalog_items = {}
-            for row in self.cursor.fetchall():
+            for row in cursor.fetchall():
                 catalog_items[row[0]] = {
                     'name': row[1],
                     'size': row[2],
@@ -1025,6 +1152,9 @@ class FolderCatalogApp(QMainWindow):
                 
         except sqlite3.Error as e:
             QMessageBox.critical(self, "Error", f"Error comparing catalog: {str(e)}")
+        finally:
+            if 'conn' in locals():
+                conn.close()
 
     def closeEvent(self, event):
         """Clean up database connection when closing the application"""

@@ -776,6 +776,8 @@ class FolderCatalogApp(QMainWindow):
 
         update_action = menu.addAction("Update Catalog")
         rename_action = menu.addAction("Rename Catalog")
+        compare_action = menu.addAction("Compare Catalog")
+        menu.addSeparator()
         delete_action = menu.addAction("Delete Catalog")
 
         action = menu.exec_(self.catalog_list.mapToGlobal(position))
@@ -784,6 +786,8 @@ class FolderCatalogApp(QMainWindow):
             self.update_catalog(item)
         elif action == rename_action:
             self.rename_catalog(item)
+        elif action == compare_action:
+            self.compare_selected_catalog()
         elif action == delete_action:
             self.delete_catalog(item)
 

@@ -342,6 +342,128 @@ class ComparisonResultsWindow(QMainWindow):
         if item:
             tree.setCurrentItem(item)
 
+class CompareWorker(QThread):
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(dict, dict, set)
+    error = pyqtSignal(str)
+    
+    def __init__(self, catalog_id, compare_path, options):
+        super().__init__()
+        self.catalog_id = catalog_id
+        self.compare_path = compare_path
+        self.options = options
+        self.is_cancelled = False
+        
+    def run(self):
+        try:
+            conn = sqlite3.connect('folder_catalog.db')
+            cursor = conn.cursor()
+            
+            # Get all files from catalog
+            cursor.execute('''
+                SELECT path, name, size, md5_hash, modified_at, is_directory
+                FROM files 
+                WHERE catalog_id = ?
+            ''', (self.catalog_id,))
+            catalog_items = {}
+            for row in cursor.fetchall():
+                catalog_items[row[0]] = {
+                    'name': row[1],
+                    'size': row[2],
+                    'md5_hash': row[3],
+                    'modified': datetime.fromisoformat(row[4]),
+                    'is_directory': row[5]
+                }
+            
+            # Get all files from comparison folder
+            compare_items = {}
+            differences = set()  # Use set for faster lookups
+            total_files = sum([len(files) for _, _, files in os.walk(self.compare_path)])
+            files_processed = 0
+            
+            for root, dirs, files in os.walk(self.compare_path):
+                if self.is_cancelled:
+                    return
+                    
+                # Process directories
+                for dir_name in dirs:
+                    full_path = os.path.join(root, dir_name)
+                    rel_path = os.path.relpath(full_path, self.compare_path)
+                    compare_items[rel_path] = {
+                        'name': dir_name,
+                        'size': 0,
+                        'modified': datetime.fromtimestamp(os.path.getmtime(full_path)),
+                        'is_directory': True
+                    }
+                    if rel_path not in catalog_items:
+                        differences.add(rel_path)
+                    self.progress.emit(files_processed, f"Processing directory: {rel_path}")
+                
+                # Process files
+                for file_name in files:
+                    if self.is_cancelled:
+                        return
+                        
+                    full_path = os.path.join(root, file_name)
+                    try:
+                        rel_path = os.path.relpath(full_path, self.compare_path)
+                        size = os.path.getsize(full_path)
+                        modified = datetime.fromtimestamp(os.path.getmtime(full_path))
+                        
+                        compare_items[rel_path] = {
+                            'name': file_name,
+                            'size': size,
+                            'modified': modified,
+                            'is_directory': False
+                        }
+                        
+                        if rel_path not in catalog_items:
+                            differences.add(rel_path)
+                            self.progress.emit(files_processed, f"New file: {rel_path}")
+                        else:
+                            catalog_item = catalog_items[rel_path]
+                            if self.options['check_size'] and size != catalog_item['size']:
+                                differences.add(rel_path)
+                                self.progress.emit(files_processed, f"Size difference: {rel_path}")
+                            if self.options['check_md5'] and catalog_item['md5_hash']:
+                                self.progress.emit(files_processed, f"Calculating MD5: {rel_path}")
+                                current_md5 = self.calculate_md5(full_path)
+                                if current_md5 != catalog_item['md5_hash']:
+                                    differences.add(rel_path)
+                                    self.progress.emit(files_processed, f"MD5 difference: {rel_path}")
+                        
+                        files_processed += 1
+                        self.progress.emit(files_processed, f"Processing: {rel_path}")
+                    except (OSError, FileNotFoundError):
+                        continue
+            
+            # Check for deleted files
+            for rel_path in catalog_items:
+                if rel_path not in compare_items:
+                    differences.add(rel_path)
+                    self.progress.emit(files_processed, f"Missing file: {rel_path}")
+            
+            self.finished.emit(catalog_items, compare_items, differences)
+            
+        except sqlite3.Error as e:
+            self.error.emit(str(e))
+        finally:
+            if 'conn' in locals():
+                conn.close()
+    
+    def calculate_md5(self, file_path):
+        """Calculate MD5 hash of a file"""
+        hash_md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                if self.is_cancelled:
+                    return None
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    
+    def cancel(self):
+        self.is_cancelled = True
+
 class CatalogWorker(QThread):
     progress = pyqtSignal(int, str)
     finished = pyqtSignal()
@@ -1063,98 +1185,51 @@ class FolderCatalogApp(QMainWindow):
 
             options = dialog.get_options()
             
-            # Get all files from catalog
-            cursor.execute('''
-                SELECT path, name, size, md5_hash, modified_at, is_directory
-                FROM files 
-                WHERE catalog_id = ?
-            ''', (catalog_id,))
-            catalog_items = {}
-            for row in cursor.fetchall():
-                catalog_items[row[0]] = {
-                    'name': row[1],
-                    'size': row[2],
-                    'md5_hash': row[3],
-                    'modified': datetime.fromisoformat(row[4]),
-                    'is_directory': row[5]
-                }
-            
-            # Get all files from comparison folder
-            compare_items = {}
-            differences = set()  # Use set for faster lookups
+            # Count total files for progress bar
             total_files = sum([len(files) for _, _, files in os.walk(compare_path)])
-            progress = QProgressDialog("Comparing files...", "Cancel", 0, total_files, self)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setWindowTitle("Progress")
-            files_processed = 0
             
-            for root, dirs, files in os.walk(compare_path):
-                # Process directories
-                for dir_name in dirs:
-                    full_path = os.path.join(root, dir_name)
-                    rel_path = os.path.relpath(full_path, compare_path)
-                    compare_items[rel_path] = {
-                        'name': dir_name,
-                        'size': 0,
-                        'modified': datetime.fromtimestamp(os.path.getmtime(full_path)),
-                        'is_directory': True
-                    }
-                    if rel_path not in catalog_items:
-                        differences.add(rel_path)
-                
-                # Process files
-                for file_name in files:
-                    if progress.wasCanceled():
-                        return
-                        
-                    full_path = os.path.join(root, file_name)
-                    try:
-                        rel_path = os.path.relpath(full_path, compare_path)
-                        size = os.path.getsize(full_path)
-                        modified = datetime.fromtimestamp(os.path.getmtime(full_path))
-                        
-                        compare_items[rel_path] = {
-                            'name': file_name,
-                            'size': size,
-                            'modified': modified,
-                            'is_directory': False
-                        }
-                        
-                        if rel_path not in catalog_items:
-                            differences.add(rel_path)
-                        else:
-                            catalog_item = catalog_items[rel_path]
-                            if options['check_size'] and size != catalog_item['size']:
-                                differences.add(rel_path)
-                            if options['check_md5'] and catalog_item['md5_hash']:
-                                current_md5 = self.calculate_md5(full_path)
-                                if current_md5 != catalog_item['md5_hash']:
-                                    differences.add(rel_path)
-                        
-                        files_processed += 1
-                        progress.setValue(files_processed)
-                    except (OSError, FileNotFoundError):
-                        continue
+            # Create progress dialog
+            self.progress = QProgressDialog("Initializing comparison...", "Cancel", 0, total_files, self)
+            self.progress.setWindowModality(Qt.WindowModal)
+            self.progress.setWindowTitle("Progress")
+            self.progress.setMinimumDuration(0)
+            self.progress.setAutoClose(True)
+            self.progress.setAutoReset(True)
             
-            # Check for deleted files
-            for rel_path in catalog_items:
-                if rel_path not in compare_items:
-                    differences.add(rel_path)
+            # Create and start worker thread
+            self.worker = CompareWorker(catalog_id, compare_path, options)
+            self.worker.progress.connect(self.update_progress)
+            self.worker.finished.connect(lambda cat_items, comp_items, diffs: self.on_compare_finished(catalog_name, compare_path, cat_items, comp_items, diffs))
+            self.worker.error.connect(self.on_compare_error)
+            self.progress.canceled.connect(self.worker.cancel)
             
-            # Show comparison results window
-            if differences:
-                results_window = ComparisonResultsWindow(catalog_name, compare_path, differences, self)
-                results_window.add_items_to_trees(catalog_items, compare_items)
-                results_window.show()
-            else:
-                QMessageBox.information(self, "Comparison Results", 
-                    f"No differences found between catalog '{catalog_name}' and selected folder!")
-                
+            # Start the worker
+            self.worker.start()
+            
         except sqlite3.Error as e:
             QMessageBox.critical(self, "Error", f"Error comparing catalog: {str(e)}")
         finally:
             if 'conn' in locals():
                 conn.close()
+    
+    def on_compare_finished(self, catalog_name, compare_path, catalog_items, compare_items, differences):
+        """Handle comparison completion"""
+        if hasattr(self, 'progress'):
+            self.progress.close()
+            
+        if differences:
+            results_window = ComparisonResultsWindow(catalog_name, compare_path, differences, self)
+            results_window.add_items_to_trees(catalog_items, compare_items)
+            results_window.show()
+        else:
+            QMessageBox.information(self, "Comparison Results", 
+                f"No differences found between catalog '{catalog_name}' and selected folder!")
+    
+    def on_compare_error(self, error_msg):
+        """Handle comparison error"""
+        if hasattr(self, 'progress'):
+            self.progress.close()
+        QMessageBox.critical(self, "Error", f"Error comparing catalog: {error_msg}")
 
     def closeEvent(self, event):
         """Clean up database connection when closing the application"""

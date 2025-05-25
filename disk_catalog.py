@@ -247,20 +247,22 @@ class FolderCatalogApp(QMainWindow):
                 # Save directories
                 for dir_name in dirs:
                     full_path = os.path.join(root, dir_name)
+                    rel_path = os.path.relpath(full_path, root_path)
                     self.cursor.execute(
                         'INSERT INTO files (catalog_id, path, name, is_directory, size, modified_at) VALUES (?, ?, ?, ?, ?, ?)',
-                        (catalog_id, full_path, dir_name, True, 0, datetime.fromtimestamp(os.path.getmtime(full_path)))
+                        (catalog_id, rel_path, dir_name, True, 0, datetime.fromtimestamp(os.path.getmtime(full_path)))
                     )
 
                 # Save files
                 for file_name in files:
                     full_path = os.path.join(root, file_name)
                     try:
+                        rel_path = os.path.relpath(full_path, root_path)
                         size = os.path.getsize(full_path)
                         modified = datetime.fromtimestamp(os.path.getmtime(full_path))
                         self.cursor.execute(
                             'INSERT INTO files (catalog_id, path, name, is_directory, size, modified_at) VALUES (?, ?, ?, ?, ?, ?)',
-                            (catalog_id, full_path, file_name, False, size, modified)
+                            (catalog_id, rel_path, file_name, False, size, modified)
                         )
                     except (OSError, FileNotFoundError):
                         continue
@@ -425,18 +427,18 @@ class FolderCatalogApp(QMainWindow):
             path_to_item = {}
             
             # First pass: create all items
-            for path, name, is_dir, size, modified in self.cursor.fetchall():
-                parent_path = os.path.dirname(path)
+            for rel_path, name, is_dir, size, modified in self.cursor.fetchall():
+                parent_path = os.path.dirname(rel_path)
                 item = QTreeWidgetItem()
                 item.setText(0, name)
                 if not is_dir:
                     item.setText(1, self.format_size(size))
                 item.setText(2, datetime.fromisoformat(modified).strftime('%Y-%m-%d %H:%M:%S'))
-                path_to_item[path] = item
+                path_to_item[rel_path] = item
             
             # Second pass: set up parent-child relationships
-            for path, item in path_to_item.items():
-                parent_path = os.path.dirname(path)
+            for rel_path, item in path_to_item.items():
+                parent_path = os.path.dirname(rel_path)
                 if parent_path in path_to_item:
                     path_to_item[parent_path].addChild(item)
                 else:
@@ -474,20 +476,22 @@ class FolderCatalogApp(QMainWindow):
                 # Save directories
                 for dir_name in dirs:
                     full_path = os.path.join(root, dir_name)
+                    rel_path = os.path.relpath(full_path, root_path)
                     self.cursor.execute(
                         'INSERT INTO files (catalog_id, path, name, is_directory, size, modified_at) VALUES (?, ?, ?, ?, ?, ?)',
-                        (catalog_id, full_path, dir_name, True, 0, datetime.fromtimestamp(os.path.getmtime(full_path)))
+                        (catalog_id, rel_path, dir_name, True, 0, datetime.fromtimestamp(os.path.getmtime(full_path)))
                     )
 
                 # Save files
                 for file_name in files:
                     full_path = os.path.join(root, file_name)
                     try:
+                        rel_path = os.path.relpath(full_path, root_path)
                         size = os.path.getsize(full_path)
                         modified = datetime.fromtimestamp(os.path.getmtime(full_path))
                         self.cursor.execute(
                             'INSERT INTO files (catalog_id, path, name, is_directory, size, modified_at) VALUES (?, ?, ?, ?, ?, ?)',
-                            (catalog_id, full_path, file_name, False, size, modified)
+                            (catalog_id, rel_path, file_name, False, size, modified)
                         )
                     except (OSError, FileNotFoundError):
                         continue
@@ -508,6 +512,17 @@ class FolderCatalogApp(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setApplicationName("Disk Catalog")
+    app.setApplicationDisplayName("Disk Catalog")
+    if sys.platform == 'darwin':  # macOS
+        app.setStyle('Fusion')  # Use Fusion style on macOS
+        # Set the application name for macOS menu bar
+        app.setWindowIcon(QIcon())  # Clear any default icon
+        app.setQuitOnLastWindowClosed(True)
+        # Set the application name in the process name
+        import ctypes
+        libc = ctypes.CDLL('libc.dylib')
+        libc.setprogname("Disk Catalog".encode('utf-8'))
     window = FolderCatalogApp()
     window.show()
     sys.exit(app.exec_())

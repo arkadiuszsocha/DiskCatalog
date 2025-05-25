@@ -47,6 +47,15 @@ class ComparisonResultsWindow(QMainWindow):
         self.setWindowTitle(f"Comparison Results: {catalog_name}")
         self.resize(1200, 800)
         
+        # Define colors for different states
+        self.colors = {
+            'same': QColor('#4caf50'),      # Green
+            'modified': QColor('#ff9800'),   # Orange
+            'missing': QColor('#f44336'),    # Red
+            'new': QColor('#2196f3'),        # Blue
+            'different': QColor('#9c27b0')   # Purple
+        }
+        
         # Create central widget and layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -148,6 +157,14 @@ class ComparisonResultsWindow(QMainWindow):
         # Create a dictionary to store path -> item mapping for catalog tree
         catalog_path_to_item = {}
         
+        # Create a set of paths that have differences in their contents
+        content_differences = set()
+        for path in self.differences:
+            parent_path = os.path.dirname(path)
+            while parent_path:
+                content_differences.add(parent_path)
+                parent_path = os.path.dirname(parent_path)
+        
         # First, create all catalog items with proper hierarchy
         for path, item_data in catalog_items.items():
             item = QTreeWidgetItem()
@@ -156,6 +173,20 @@ class ComparisonResultsWindow(QMainWindow):
                 item.setText(1, self.format_size(item_data['size']))
             item.setText(2, item_data['modified'].strftime('%Y-%m-%d %H:%M:%S'))
             item.setData(0, Qt.UserRole, path)
+            
+            # Color the item in catalog tree if it has differences
+            if path in self.differences:
+                if item_data['is_directory']:
+                    color = self.colors['different']
+                else:
+                    color = self.colors['modified']
+                for i in range(3):
+                    item.setBackground(i, color)
+            elif path in content_differences:
+                # This is a parent folder of a different item
+                color = self.colors['different']
+                for i in range(3):
+                    item.setBackground(i, color)
             
             # Store the item in the mapping
             catalog_path_to_item[path] = item
@@ -185,14 +216,26 @@ class ComparisonResultsWindow(QMainWindow):
                 
                 # Check for differences
                 if path in self.differences:
-                    compare_item.setText(3, "Modified")
-                    compare_item.setBackground(0, QColor('#ff6b6b'))  # Red for differences
-                    compare_item.setBackground(1, QColor('#ff6b6b'))
-                    compare_item.setBackground(2, QColor('#ff6b6b'))
-                    compare_item.setBackground(3, QColor('#ff6b6b'))
+                    if item_data['is_directory']:
+                        compare_item.setText(3, "Different Contents")
+                        color = self.colors['different']
+                    else:
+                        compare_item.setText(3, "Modified")
+                        color = self.colors['modified']
+                    
+                    # Apply color to all columns
+                    for i in range(4):
+                        compare_item.setBackground(i, color)
+                elif path in content_differences:
+                    # This is a parent folder of a different item
+                    compare_item.setText(3, "Different Contents")
+                    color = self.colors['different']
+                    for i in range(4):
+                        compare_item.setBackground(i, color)
                 else:
                     compare_item.setText(3, "Same")
-                    compare_item.setBackground(3, QColor('#4caf50'))  # Green for same
+                    color = self.colors['same']
+                    compare_item.setBackground(3, color)
             else:
                 # File doesn't exist in comparison folder
                 compare_item.setText(0, item_data['name'])
@@ -200,10 +243,11 @@ class ComparisonResultsWindow(QMainWindow):
                     compare_item.setText(1, self.format_size(item_data['size']))
                 compare_item.setText(2, item_data['modified'].strftime('%Y-%m-%d %H:%M:%S'))
                 compare_item.setText(3, "Missing")
-                compare_item.setBackground(0, QColor('#ff6b6b'))  # Red for missing
-                compare_item.setBackground(1, QColor('#ff6b6b'))
-                compare_item.setBackground(2, QColor('#ff6b6b'))
-                compare_item.setBackground(3, QColor('#ff6b6b'))
+                color = self.colors['missing']
+                
+                # Apply color to all columns
+                for i in range(4):
+                    compare_item.setBackground(i, color)
             
             # Find parent path
             parent_path = os.path.dirname(path)
@@ -227,10 +271,12 @@ class ComparisonResultsWindow(QMainWindow):
                     compare_item.setText(1, self.format_size(item_data['size']))
                 compare_item.setText(2, item_data['modified'].strftime('%Y-%m-%d %H:%M:%S'))
                 compare_item.setText(3, "New")
-                compare_item.setBackground(0, QColor('#ff6b6b'))  # Red for new
-                compare_item.setBackground(1, QColor('#ff6b6b'))
-                compare_item.setBackground(2, QColor('#ff6b6b'))
-                compare_item.setBackground(3, QColor('#ff6b6b'))
+                color = self.colors['new']
+                
+                # Apply color to all columns
+                for i in range(4):
+                    compare_item.setBackground(i, color)
+                
                 compare_item.setData(0, Qt.UserRole, path)
                 
                 # Find parent path
